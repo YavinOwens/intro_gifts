@@ -1,0 +1,22 @@
+# Main dependencies
+streamlit
+pandas
+requests
+spacy
+ollama  # If using the Ollama Python SDK, otherwise remove
+pytest  # For running tests
+
+duckduckgo-search  # For web search integration
+# Qdrant is referenced in clear_qdrant.py, but code is commented out. Uncomment if needed:
+# qdrant-client
+
+# For subprocess usage (standard library, no need to install)
+# For typing (standard library, no need to install)
+# For os, json, tempfile, shutil (standard library, no need to install)
+
+# If using spaCy models, ensure en_core_web_sm is downloaded:
+# python -m spacy download en_core_web_sm 
+
+pdfplumber
+beautifulsoup4
+psycopg2-binary 
