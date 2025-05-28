@@ -7,23 +7,33 @@ import numpy as np
 import re
 import spacy
 import requests
+import chromadb
+from sentence_transformers import SentenceTransformer
+# --- Ensure ChromaDB is always up-to-date with workforce/Department files ---
+# import importlib.util
+# chromadb_ingest_path = os.path.join(os.path.dirname(__file__), 'chromadb_ingest.py')
+# spec = importlib.util.spec_from_file_location('chromadb_ingest', chromadb_ingest_path)
+# chromadb_ingest = importlib.util.module_from_spec(spec)
+# spec.loader.exec_module(chromadb_ingest)
+# chromadb_ingest.main()  # This will re-index all files on app start
 
 st.set_page_config(page_title="Digital Product Release Dashboard", layout="wide")
 
 st.title("Digital Product Release Dashboard")
-st.markdown("""
-This dashboard summarizes digital product releases, teams, squads, and workforce information from your working docs.
-
-**Features:**
-- Summary metrics for products, teams, squads, releases, and workforce
-- Visualizations: products per team, releases per squad, workforce by team
-- Raw data previews for each table
-""")
 
 # --- File paths ---
 BASE_DIR = Path(__file__).parent
 csv_dir = BASE_DIR / "csv"
 workforce_dir = BASE_DIR / "workforce"
+
+# --- ChromaDB RAG Setup (moved to top so embedder is always defined) ---
+CHROMA_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '../chromadb_store'))
+COLLECTION_NAME = 'csv_docs'
+EMBED_MODEL = 'all-MiniLM-L6-v2'
+
+chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
+embedder = SentenceTransformer(EMBED_MODEL)
 
 # --- Load Data ---
 def load_csv(filename):
@@ -80,7 +90,7 @@ if 'product_assistant_history' not in st.session_state:
     st.session_state['product_assistant_history'] = []
 
 # --- Tabs for analytics ---
-tabs = st.tabs(["Summary & Feature Metrics", "Team & Product Analytics", "Feature Assignment", "Simulation", "Workforce Skills Overview", "Product Assistant"])
+tabs = st.tabs(["Summary & Feature Metrics", "Team & Product Analytics", "Feature Assignment", "Simulation", "Workforce Skills Overview", "Product Assistant", "Document Assistant"])
 
 with tabs[0]:
     # Keep summary metrics and advanced feature/timeline charts here
@@ -434,6 +444,12 @@ with tabs[5]:
     # Chat input
     user_input = st.chat_input('Ask about your data, tables, charts, or graphs:')
     if user_input:
+        # RAG: Retrieve top 3 relevant CSV rows from ChromaDB
+        query_emb = embedder.encode([user_input])[0]
+        results = collection.query(query_embeddings=[query_emb], n_results=3)
+        rag_context = ''
+        for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
+            rag_context += f"[From {meta['filename']} row {meta['row']}]: {doc}\n"
         # Compose context from all dataframes
         context = ''
         try:
@@ -492,20 +508,21 @@ with tabs[5]:
                 schema_info += f"\n{name} columns: {', '.join([f'{col} ({df[col].dtype})' for col in df.columns])}"
         visualization_instruction = (
             "When the user requests a visualization, generate only the code to create the chart "
-            # "(e.g., using matplotlib, plotly, or seaborn), not a full Streamlit app. "
             "Assume the relevant dataframes {schema_info} (such as skill_df, product_df, etc.) are already loaded and available. "
             "Do not include Streamlit UI code (such as st.write, st.button, st.plotly_chart, etc.). "
             "Return only the code for the visualization logic and plotting. "
             "Always return code in a code block with triple backticks and the word python (e.g., ```python ... ```), so it can be executed directly. "
             "Never use a variable named df—always use the actual dataframe variable names provided (e.g., skills_df, product_df, etc.). "
             "Only use matplotlib for all visualizations. Do not use plotly, seaborn, or any other library. "
-            "Always check that arrays or lists used for plotting or DataFrame creation are the same length to avoid errors."
+            "Always check that arrays or lists used for plotting or DataFrame creation are the same length to avoid errors. "
+            "You can also help the user find files in the workforce directory. If the user asks for a file, search the RAG context and return the file name, type, department, and relative path if found."
         )
         prompt = (
             "You are a helpful data assistant. The user can ask about the data, tables, charts, or graphs in the Streamlit dashboard. "
             f"{visualization_instruction} "
             "When generating Python code, use the dataframe variables as defined below. Do not re-read CSVs. "
             f"{schema_info}\n\n"
+            f"RAG Context (retrieved from CSVs):\n{rag_context}\n"
             "Context:\n"
             f"{context}\n\n"
             f"User: {user_input}\nBot:"
@@ -533,131 +550,84 @@ with tabs[5]:
         st.session_state['product_assistant_history'].append(('assistant', bot_reply))
         st.rerun()
 
-# --- Sidebar: Chatbot (phi3:mini via Ollama) ---
+with tabs[6]:
+    st.header('Document Assistant (RAG)')
+    # List all available files in ChromaDB (only indexed files)
+    all_metas = collection.get(include=['metadatas'])['metadatas']
+    file_list = []
+    table_rows = []
+    for meta in all_metas:
+        if meta and 'filename' in meta:
+            file_list.append(f"{meta.get('filename')} (type: {meta.get('file_type', 'unknown')}, dept: {meta.get('department', '-')}, path: {meta.get('relative_path', '-')})")
+            table_rows.append({
+                'Filename': meta.get('filename'),
+                'File Type': meta.get('file_type', 'unknown'),
+                'Department': meta.get('department', '-'),
+                'Relative Path': meta.get('relative_path', '-')
+            })
+    with st.expander('Available Files in Database (for prompt writing)', expanded=True):
+        if table_rows:
+            st.dataframe(pd.DataFrame(table_rows))
+        else:
+            st.info('No files found in ChromaDB.')
+    # Chat UI for document Q&A
+    if 'doc_assistant_history' not in st.session_state:
+        st.session_state['doc_assistant_history'] = []
+    for message in st.session_state['doc_assistant_history']:
+        role, text = message
+        st.chat_message(role).write(text)
+    doc_user_input = st.chat_input('Ask about your documentation or files:')
+    if doc_user_input:
+        # RAG: Retrieve top 3 relevant files/chunks from ChromaDB
+        doc_query_emb = embedder.encode([doc_user_input])[0]
+        doc_results = collection.query(query_embeddings=[doc_query_emb], n_results=3)
+        doc_rag_context = ''
+        for doc, meta in zip(doc_results['documents'][0], doc_results['metadatas'][0]):
+            doc_rag_context += f"[From {meta.get('filename', '?')} (type: {meta.get('file_type', '?')}, dept: {meta.get('department', '-')}, path: {meta.get('relative_path', '-')})]: {doc}\n"
+        doc_prompt = (
+            "You are a helpful document assistant. The user can ask about any documentation or file in the database. "
+            "Use the RAG context below to answer the user's question. If the answer is not in the context, say you don't know.\n"
+            f"RAG Context (retrieved from files):\n{doc_rag_context}\n"
+            f"User: {doc_user_input}\nBot:"
+        )
+        # Call Ollama phi4-mini:latest
+        try:
+            response = requests.post(
+                'http://localhost:11434/api/generate',
+                json={
+                    'model': 'phi4-mini:latest',
+                    'prompt': doc_prompt,
+                    'stream': False
+                },
+                timeout=180
+            )
+            if response.status_code == 200:
+                doc_bot_reply = response.json().get('response', '').strip()
+            else:
+                doc_bot_reply = f"[Error from Ollama: {response.status_code}]"
+        except requests.exceptions.Timeout:
+            doc_bot_reply = "[Error: Ollama timed out. The model may be slow to load or busy. Try again or increase the timeout.]"
+        except Exception as e:
+            doc_bot_reply = f"[Error connecting to Ollama: {e}]"
+        st.session_state['doc_assistant_history'].append(('user', doc_user_input))
+        st.session_state['doc_assistant_history'].append(('assistant', doc_bot_reply))
+        st.rerun()
+
+# --- User Guide/Info Section (at top of sidebar) ---
+st.sidebar.header('How to Use This App')
+st.sidebar.markdown('''
+**Main Features:**
+- **Dashboard Tabs:** Navigate the main tabs to view product, team, release, simulation, and workforce analytics.
+- **Document Assistant (RAG):** In the last tab, see all indexed files and ask questions about your documentation and files. The assistant uses retrieval-augmented generation for accurate answers.
+- **Product Assistant (Chatbot):** Use the Product Assistant tab to chat with an AI about your data, tables, and charts. It can generate code and answer questions using your loaded data.
+- **Skill Extraction:** Use the sidebar to select a department and person to extract and view code elements or skills from their files.
+
+**Tips:**
+- Use the expanders and tables to explore available data and files.
+- For best results, keep your CSVs and workforce files up to date.
+- Indexed files are shown in the Document Assistant tab for easy reference.
+''')
 st.sidebar.markdown('---')
-st.sidebar.header('Data Chatbot (phi3:mini)')
-
-# Use shared chat history
-def sidebar_chat():
-    # Display chat history
-    for i, (role, text) in enumerate(st.session_state['product_assistant_history']):
-        if role == 'user':
-            with st.sidebar.expander(f'User: {text}', expanded=False):
-                pass
-        elif role == 'assistant':
-            with st.sidebar.expander(f'Bot:', expanded=False):
-                st.markdown(text)
-    # Chat input
-    user_input = st.sidebar.text_area('Ask about your data, tables, charts, or graphs:', key='chat_input')
-    if st.sidebar.button('Send', key='send_chat') and user_input.strip():
-        # Compose context from all dataframes
-        context = ''
-        try:
-            context += '\n--- Product Data ---\n' + product_df.head(10).to_csv(index=False)
-        except Exception: pass
-        try:
-            context += '\n--- Release Data ---\n' + release_df.head(10).to_csv(index=False)
-        except Exception: pass
-        try:
-            context += '\n--- Team Data ---\n' + team_df.head(10).to_csv(index=False)
-        except Exception: pass
-        try:
-            context += '\n--- Squad Data ---\n' + squad_df.head(10).to_csv(index=False)
-        except Exception: pass
-        try:
-            context += '\n--- Workforce Data ---\n' + workforce_df.head(10).to_csv(index=False)
-        except Exception: pass
-        try:
-            context += '\n--- Simulated Assignment ---\n' + assign_sim_df.head(10).to_csv(index=False)
-        except Exception: pass
-        try:
-            context += '\n--- Skills Extracted ---\n' + skill_df.head(10).to_csv(index=False)
-        except Exception: pass
-        # Compose schema info for each dataframe
-        schema_info = ""
-        for name, df in [
-            ("product_df", product_df),
-            ("release_df", release_df),
-            ("team_df", team_df),
-            ("squad_df", squad_df),
-            ("workforce_df", workforce_df),
-        ]:
-            if not df.empty:
-                schema_info += f"\n{name} columns: {', '.join([f'{col} ({df[col].dtype})' for col in df.columns])}"
-        prompt = (
-            "You are a helpful data assistant. The user can ask about the data, tables, charts, or graphs in the Streamlit dashboard. "
-            "When generating Python code, use the dataframe variables as defined below. Do not re-read CSVs. "
-            f"{schema_info}\n\n"
-            "Context:\n"
-            f"{context}\n\n"
-            f"User: {user_input}\nBot:"
-        )
-        # Call Ollama phi4-mini:latest
-        try:
-            response = requests.post(
-                'http://localhost:11434/api/generate',
-                json={
-                    'model': 'phi4-mini:latest',
-                    'prompt': prompt,
-                    'stream': False
-                },
-                timeout=180
-            )
-            if response.status_code == 200:
-                bot_reply = response.json().get('response', '').strip()
-            else:
-                bot_reply = f"[Error from Ollama: {response.status_code}]"
-        except requests.exceptions.Timeout:
-            bot_reply = "[Error: Ollama timed out. The model may be slow to load or busy. Try again or increase the timeout.]"
-        except Exception as e:
-            bot_reply = f"[Error connecting to Ollama: {e}]"
-        st.session_state['product_assistant_history'].append(('user', user_input))
-        st.session_state['product_assistant_history'].append(('assistant', bot_reply))
-        st.rerun()
-
-sidebar_chat()
-
-# --- Raw Data Expanders ---
-# with st.expander("Product Table"):
-#     st.dataframe(product_df)
-# with st.expander("Release Table"):
-#     st.dataframe(release_df)
-# with st.expander("Squad Table"):
-#     st.dataframe(squad_df)
-# with st.expander("Team Table"):
-#     st.dataframe(team_df)
-# with st.expander("Workforce Table"):
-#     st.dataframe(workforce_df)
-
-# --- Generate Team_Feature_Assignment.csv ---
-try:
-    # Use cleaned dataframes
-    if not product_df.empty and not team_df.empty:
-        assignment_rows = []
-        for _, prod_row in product_df.iterrows():
-            dept = prod_row.get('Department', '')
-            team = prod_row.get('Team', '')
-            product = prod_row.get('Product', '')
-            client = prod_row.get('Client', '')
-            feature = prod_row.get('Features', '')
-            # Find all team members in this department
-            members = team_df[team_df['Department'] == dept]['Names'].tolist()
-            for member in members:
-                assignment_rows.append({
-                    'Department': dept,
-                    'Team': team,
-                    'Product': product,
-                    'Client': client,
-                    'Feature': feature,
-                    'Team Member': member
-                })
-        if assignment_rows:
-            assign_df = pd.DataFrame(assignment_rows)
-            assign_df.to_csv(BASE_DIR / 'csv' / 'Product Tracker - Team_Feature_Assignment.csv', index=False)
-except Exception as e:
-    st.warning(f'Could not generate Team_Feature_Assignment.csv: {e}')
-
-st.caption("This dashboard was auto-generated to provide a digital product release overview from your working docs.")
 
 # --- Sidebar: Department/Person Skill Extraction ---
 st.sidebar.header("Department File Skill Extractor")
